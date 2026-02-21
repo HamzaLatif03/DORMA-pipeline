@@ -1,6 +1,6 @@
 """
 Brain script: reads serial from Arduino Uno, triggers play on the server
-so the iPhone (web app) plays the requested audio. Run the server first.
+so the iPhone (web app) plays the requested audio. Run the server first. com 
 """
 import argparse
 import logging
