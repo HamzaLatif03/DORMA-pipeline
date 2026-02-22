@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
 
 # Data
 computer/faces.json
@@ -16,3 +17,9 @@ computer/faces.json
 *.swo
 
 faces.json
+.env
+__pycache__/
+*.pyc
+.DS_Store
+output.mp3
+.vscode/
