@@ -69,6 +69,7 @@
   <div class="section">
     <button id="connectBtn" type="button">Connect &amp; start stream</button>
     <button id="disconnectBtn" type="button" class="secondary" disabled>Stop</button>
+    <button id="flipBtn" type="button" class="secondary" disabled>Flip Camera</button>
     <button id="viewBtn" type="button" class="secondary">View stream</button>
     <button id="stopViewBtn" type="button" class="secondary" disabled style="display:none;">Stop viewing</button>
   </div>
@@ -85,6 +86,7 @@
       const serverUrlInput = document.getElementById('serverUrl');
       const connectBtn = document.getElementById('connectBtn');
       const disconnectBtn = document.getElementById('disconnectBtn');
+      const flipBtn = document.getElementById('flipBtn');
       const viewBtn = document.getElementById('viewBtn');
       const stopViewBtn = document.getElementById('stopViewBtn');
       const preview = document.getElementById('preview');
@@ -96,6 +98,7 @@
       let localStream = null;
       let pollIntervalId = null;
       let frameIntervalId = null;
+      let facingMode = 'user';
       const audioEl = new Audio();
 
       function setStatus(msg, isError) {
@@ -116,10 +119,33 @@
 
       async function startCapture() {
         if (localStream) return localStream;
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facingMode },
+          audio: true
+        });
         localStream = stream;
         preview.srcObject = stream;
         return stream;
+      }
+
+      async function flipCamera() {
+        facingMode = facingMode === 'user' ? 'environment' : 'user';
+        if (localStream) {
+          localStream.getTracks().forEach(t => t.stop());
+          localStream = null;
+        }
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: facingMode },
+            audio: true
+          });
+          localStream = stream;
+          preview.srcObject = stream;
+          setStatus('Switched to ' + (facingMode === 'user' ? 'front' : 'rear') + ' camera.');
+        } catch (err) {
+          setStatus('Could not switch camera: ' + (err.message || err), true);
+          facingMode = facingMode === 'user' ? 'environment' : 'user';
+        }
       }
 
       /** iPhone → Mac video via HTTP only (no WebRTC). Works whenever /api/ping works. */
@@ -208,6 +234,7 @@
         preview.srcObject = null;
         connectBtn.disabled = false;
         disconnectBtn.disabled = true;
+        flipBtn.disabled = true;
       }
 
       function startViewing() {
@@ -234,9 +261,11 @@
       connectBtn.onclick = () => {
         connectBtn.disabled = true;
         disconnectBtn.disabled = false;
+        flipBtn.disabled = false;
         connect();
       };
       disconnectBtn.onclick = disconnect;
+      flipBtn.onclick = flipCamera;
       viewBtn.onclick = startViewing;
       stopViewBtn.onclick = stopViewing;
 
