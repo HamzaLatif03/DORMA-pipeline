@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>iPhone Peripherals</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 1rem;
+      background: #1a1a1a;
+      color: #eee;
+      min-height: 100vh;
+    }
+    h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
+    .section { margin-bottom: 1rem; }
+    label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; color: #aaa; }
+    input[type="text"] {
+      width: 100%;
+      padding: 0.5rem;
+      font-size: 1rem;
+      border: 1px solid #444;
+      border-radius: 6px;
+      background: #2a2a2a;
+      color: #eee;
+    }
+    button {
+      padding: 0.6rem 1rem;
+      font-size: 1rem;
+      border: none;
+      border-radius: 8px;
+      background: #0a7c42;
+      color: white;
+      cursor: pointer;
+      margin-right: 0.5rem;
+      margin-top: 0.25rem;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #333; }
+    #status { font-size: 0.85rem; color: #888; margin-top: 0.5rem; }
+    #preview { width: 100%; max-width: 320px; height: 240px; object-fit: cover; border-radius: 8px; background: #000; display: block; }
+    .error { color: #e74; }
+    .ok { color: #6c6; }
+  </style>
+</head>
+<body>
+  <h1>iPhone Peripherals</h1>
+  <p>Stream camera + mic to the server and play audio from the server.</p>
+  <p style="font-size:0.85rem; color:#888;">iPhone: camera only works over <strong>HTTPS</strong>. Use ngrok: on the Mac run <code>ngrok http 8000</code>, then on the iPhone open the <strong>https://</strong> URL (not http).</p>
+
+  <div class="section" id="troubleshootSection" style="background:#252525; padding:0.75rem; border-radius:8px; margin-bottom:1rem;">
+    <strong style="font-size:0.9rem;">iPhone: &quot;getUserMedia&quot; or camera not working?</strong>
+    <p style="font-size:0.85rem; color:#bbb; margin:0.35rem 0 0 0;">iOS Safari only allows camera over <strong>HTTPS</strong>. Use ngrok:</p>
+    <ol style="font-size:0.85rem; color:#bbb; margin:0.35rem 0 0 1.2rem; padding:0;">
+      <li>On the <strong>Mac</strong> (with the server running): install <a href="https://ngrok.com/download" style="color:#6c6;">ngrok</a>, then run <code>ngrok http 8000</code>.</li>
+      <li>Copy the <strong>https://</strong> URL ngrok shows (e.g. <code>https://abc123.ngrok-free.app</code>).</li>
+      <li>On the <strong>iPhone</strong>, open that <strong>https</strong> URL in Safari and tap Connect &amp; start stream.</li>
+    </ol>
+    <p style="font-size:0.85rem; color:#888; margin:0.5rem 0 0 0;">If connection times out: use iPhone hotspot (connect Mac to it, then use the Mac\u2019s IP on the iPhone). Check Mac firewall allows port 8000.</p>
+  </div>
+
+  <div class="section">
+    <label for="serverUrl">Server URL (same WiFi as this device)</label>
+    <input type="text" id="serverUrl" placeholder="http://192.168.1.100:8000" value="">
+  </div>
+
+  <div class="section">
+    <button id="connectBtn" type="button">Connect &amp; start stream</button>
+    <button id="disconnectBtn" type="button" class="secondary" disabled>Stop</button>
+    <button id="flipBtn" type="button" class="secondary" disabled>Flip Camera</button>
+    <button id="viewBtn" type="button" class="secondary">View stream</button>
+    <button id="stopViewBtn" type="button" class="secondary" disabled style="display:none;">Stop viewing</button>
+  </div>
+
+  <div class="section">
+    <video id="preview" autoplay playsinline muted></video>
+    <img id="streamView" alt="Live stream" style="display:none; width:100%; max-width:320px; height:240px; object-fit:cover; border-radius:8px; background:#000;">
+  </div>
+
+  <div id="status">Enter server URL and tap Connect.</div>
+
+  <script>
+    (function () {
+      const serverUrlInput = document.getElementById('serverUrl');
+      const connectBtn = document.getElementById('connectBtn');
+      const disconnectBtn = document.getElementById('disconnectBtn');
+      const flipBtn = document.getElementById('flipBtn');
+      const viewBtn = document.getElementById('viewBtn');
+      const stopViewBtn = document.getElementById('stopViewBtn');
+      const preview = document.getElementById('preview');
+      const streamView = document.getElementById('streamView');
+      const statusEl = document.getElementById('status');
+
+      let ws = null;
+      let pc = null;
+      let localStream = null;
+      let pollIntervalId = null;
+      let frameIntervalId = null;
+      let facingMode = 'user';
+      const audioEl = new Audio();
+
+      function setStatus(msg, isError) {
+        statusEl.textContent = msg;
+        statusEl.className = isError ? 'error' : 'ok';
+      }
+
+      function getBaseUrl() {
+        let base = (serverUrlInput.value || '').trim();
+        if (!base) base = location.origin;
+        return base.replace(/\/$/, '');
+      }
+
+      function getWsUrl() {
+        const base = getBaseUrl();
+        return (base.replace(/^http/, 'ws') + '/ws');
+      }
+
+      async function startCapture() {
+        if (localStream) return localStream;
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facingMode },
+          audio: true
+        });
+        localStream = stream;
+        preview.srcObject = stream;
+        return stream;
+      }
+
+      async function flipCamera() {
+        facingMode = facingMode === 'user' ? 'environment' : 'user';
+        if (localStream) {
+          localStream.getTracks().forEach(t => t.stop());
+          localStream = null;
+        }
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: facingMode },
+            audio: true
+          });
+          localStream = stream;
+          preview.srcObject = stream;
+          setStatus('Switched to ' + (facingMode === 'user' ? 'front' : 'rear') + ' camera.');
+        } catch (err) {
+          setStatus('Could not switch camera: ' + (err.message || err), true);
+          facingMode = facingMode === 'user' ? 'environment' : 'user';
+        }
+      }
+
+      /** iPhone → Mac video via HTTP only (no WebRTC). Works whenever /api/ping works. */
+      async function connect() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setStatus('Camera requires HTTPS on iPhone. On the Mac run: ngrok http 8000. Then on the iPhone open the https://... URL ngrok shows (not http).', true);
+          return;
+        }
+        setStatus('Starting camera…');
+        const base = getBaseUrl();
+        try {
+          const stream = await startCapture();
+          setStatus('Camera on. Sending video to Mac…');
+          preview.srcObject = stream;
+          var sessionId = null;
+          var canvas = document.createElement('canvas');
+          var ctx = canvas.getContext('2d');
+          var sending = false;
+          function sendFrame() {
+            if (!preview.videoWidth || sending) return;
+            canvas.width = preview.videoWidth;
+            canvas.height = preview.videoHeight;
+            ctx.drawImage(preview, 0, 0);
+            canvas.toBlob(function(blob) {
+              if (!blob) return;
+              sending = true;
+              fetch(base + '/api/frame', { method: 'POST', body: blob })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                  if (data.session_id && !sessionId) {
+                    sessionId = data.session_id;
+                    setStatus('Streaming to Mac. View on Mac: open this URL and tap View stream.');
+                    pollIntervalId = setInterval(function() {
+                      fetch(base + '/api/poll?session_id=' + encodeURIComponent(sessionId))
+                        .then(function(pr) { return pr.json(); })
+                        .then(function(cmd) {
+                          if (cmd.action === 'play' && cmd.url) {
+                            audioEl.src = cmd.url;
+                            audioEl.play().catch(function() {});
+                            setStatus('Playing: ' + cmd.url);
+                          }
+                        })
+                        .catch(function() {});
+                    }, 1500);
+                  }
+                })
+                .catch(function() {})
+                .then(function() { sending = false; });
+            }, 'image/jpeg', 0.6);
+          }
+          frameIntervalId = setInterval(sendFrame, 200);
+          sendFrame();
+        } catch (err) {
+          var msg = err.message || String(err);
+          if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
+            msg = 'Camera/mic denied. On iPhone allow camera in Settings or use HTTPS (ngrok).';
+          else if (err.name === 'SecurityError')
+            msg = 'Camera requires HTTPS. On iPhone open this site via ngrok.';
+          setStatus('Error: ' + msg, true);
+          connectBtn.disabled = false;
+          disconnectBtn.disabled = true;
+        }
+      }
+
+      function disconnect() {
+        if (frameIntervalId) {
+          clearInterval(frameIntervalId);
+          frameIntervalId = null;
+        }
+        if (pollIntervalId) {
+          clearInterval(pollIntervalId);
+          pollIntervalId = null;
+        }
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        if (localStream) {
+          localStream.getTracks().forEach(t => t.stop());
+          localStream = null;
+        }
+        preview.srcObject = null;
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+        flipBtn.disabled = true;
+      }
+
+      function startViewing() {
+        const base = getBaseUrl();
+        streamView.src = base + '/stream';
+        streamView.style.display = 'block';
+        preview.style.display = 'none';
+        viewBtn.style.display = 'none';
+        stopViewBtn.style.display = 'inline-block';
+        stopViewBtn.disabled = false;
+        setStatus('Viewing stream from server. Use another device (e.g. iPhone) as the camera.');
+      }
+
+      function stopViewing() {
+        streamView.src = '';
+        streamView.style.display = 'none';
+        preview.style.display = 'block';
+        viewBtn.style.display = 'inline-block';
+        stopViewBtn.style.display = 'none';
+        stopViewBtn.disabled = true;
+        setStatus('Stopped viewing.');
+      }
+
+      connectBtn.onclick = () => {
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+        flipBtn.disabled = false;
+        connect();
+      };
+      disconnectBtn.onclick = disconnect;
+      flipBtn.onclick = flipCamera;
+      viewBtn.onclick = startViewing;
+      stopViewBtn.onclick = stopViewing;
+
+      // Pre-fill server URL when on same host (e.g. desktop test)
+      if (!serverUrlInput.value && location.host)
+        serverUrlInput.placeholder = location.origin;
+
+    })();
+  </script>
+</body>
+</html>
