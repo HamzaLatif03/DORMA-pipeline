@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.git/
+.gitignore
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+output.mp3
+*.mp4

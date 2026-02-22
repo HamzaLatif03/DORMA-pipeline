@@ -83,6 +83,16 @@
     <strong style="font-size:0.9rem;">Detected face IDs</strong>
     <div id="facesDetected" style="font-size:0.9rem; color:#6c6; margin-top:0.5rem; font-family:monospace;">—</div>
   </div>
+  <div id="vitalsSection" class="section" style="display:none; background:#252525; padding:0.75rem; border-radius:8px;">
+    <strong style="font-size:0.9rem;">Vitals (Presage)</strong>
+    <div id="vitalsStatus" style="font-size:0.8rem; color:#888; margin-top:0.35rem;"></div>
+    <div style="display:flex; gap:1.5rem; margin-top:0.5rem; flex-wrap:wrap;">
+      <div><span style="font-size:0.8rem; color:#aaa;">Heart Rate</span><div id="vitalsHR" style="font-size:1.5rem; font-weight:bold; color:#e66; font-family:monospace;">—</div></div>
+      <div><span style="font-size:0.8rem; color:#aaa;">Resp. Rate</span><div id="vitalsRR" style="font-size:1.5rem; font-weight:bold; color:#6ae; font-family:monospace;">—</div></div>
+      <div><span style="font-size:0.8rem; color:#aaa;">HRV (SDNN)</span><div id="vitalsHRVsdnn" style="font-size:1.5rem; font-weight:bold; color:#ae6; font-family:monospace;">—</div></div>
+      <div><span style="font-size:0.8rem; color:#aaa;">HRV (RMSSD)</span><div id="vitalsHRVrmssd" style="font-size:1.5rem; font-weight:bold; color:#ea6; font-family:monospace;">—</div></div>
+    </div>
+  </div>
   <div id="transcriptSection" class="section" style="display:none; background:#252525; padding:0.75rem; border-radius:8px; max-height:200px; overflow-y:auto;">
     <strong style="font-size:0.9rem;">Live transcript</strong>
     <div id="transcript" style="font-size:0.95rem; color:#ccc; margin-top:0.5rem; white-space:pre-wrap; min-height:1.5em;"></div>
@@ -107,6 +117,12 @@
       const facesDetectedEl = document.getElementById('facesDetected');
       const transcriptSection = document.getElementById('transcriptSection');
       const transcriptEl = document.getElementById('transcript');
+      const vitalsSection = document.getElementById('vitalsSection');
+      const vitalsStatusEl = document.getElementById('vitalsStatus');
+      const vitalsHREl = document.getElementById('vitalsHR');
+      const vitalsRREl = document.getElementById('vitalsRR');
+      const vitalsHRVsdnnEl = document.getElementById('vitalsHRVsdnn');
+      const vitalsHRVrmssdEl = document.getElementById('vitalsHRVrmssd');
       const statusEl = document.getElementById('status');
       const audioStatusEl = document.getElementById('audioStatus');
       const diagnosticBtn = document.getElementById('diagnosticBtn');
@@ -126,6 +142,7 @@
       let audioEventSource = null;
       let transcriptEventSource = null;
       let facesPollIntervalId = null;
+      let vitalsPollIntervalId = null;
       let useHttpAudio = false;
       let viewingActive = false;
       let audioContext = null;
@@ -238,7 +255,7 @@
                 .then(function() { sending = false; });
             }, 'image/jpeg', 0.6);
           }
-          frameIntervalId = setInterval(sendFrame, 200);
+          frameIntervalId = setInterval(sendFrame, 100);
           sendFrame();
 
           // Transcription: Web Speech API (works on iOS Safari - no audio streaming needed)
@@ -460,6 +477,12 @@
         streamView.style.display = 'block';
         preview.style.display = 'none';
         facesSection.style.display = 'block';
+        vitalsSection.style.display = 'block';
+        vitalsStatusEl.textContent = 'Collecting frames…';
+        vitalsHREl.textContent = '—';
+        vitalsRREl.textContent = '—';
+        vitalsHRVsdnnEl.textContent = '—';
+        vitalsHRVrmssdEl.textContent = '—';
         transcriptSection.style.display = 'block';
         transcriptEl.textContent = 'Waiting for speech…';
         viewBtn.style.display = 'none';
@@ -479,6 +502,41 @@
               facesDetectedEl.textContent = ids.length ? ids.join(', ') : 'No faces detected';
             }).catch(function () {});
         }, 1000);
+
+        function lastVal(obj) {
+          if (!obj || typeof obj !== 'object') return null;
+          var keys = Object.keys(obj).sort(function (a, b) { return parseFloat(a) - parseFloat(b); });
+          return keys.length ? Math.round(obj[keys[keys.length - 1]]) : null;
+        }
+        vitalsPollIntervalId = setInterval(function () {
+          fetch(base + '/api/vitals').then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d.status === 'ok') {
+                var hr = lastVal(d.hr);
+                var rr = lastVal(d.rr);
+                vitalsHREl.textContent = hr !== null ? hr + ' bpm' : '—';
+                vitalsRREl.textContent = rr !== null ? rr + ' rpm' : '—';
+                vitalsHRVsdnnEl.textContent = d.hrv_sdnn != null ? Math.round(d.hrv_sdnn) + ' ms' : '—';
+                vitalsHRVrmssdEl.textContent = d.hrv_rmssd != null ? Math.round(d.hrv_rmssd) + ' ms' : '—';
+                vitalsStatusEl.textContent = d.processing ? 'Next reading in progress…' : 'Updated ' + Math.round(d.age_seconds) + 's ago';
+              } else if (d.status === 'buffering') {
+                vitalsStatusEl.textContent = 'Recording: ' + d.frames + ' frames, ' + d.seconds_left + 's left';
+              } else if (d.status === 'processing') {
+                vitalsStatusEl.textContent = 'Analysing clip (' + d.frames + ' frames)…';
+              } else if (d.status === 'idle') {
+                vitalsStatusEl.textContent = 'Waiting for camera frames…';
+              } else if (d.status === 'sdk_unavailable') {
+                vitalsStatusEl.textContent = 'SDK not available — deploy in Docker to enable';
+                vitalsStatusEl.style.color = '#ea6';
+              } else if (d.status === 'error') {
+                vitalsStatusEl.textContent = 'Error: ' + d.message;
+                vitalsStatusEl.style.color = '#e74';
+              } else {
+                vitalsStatusEl.textContent = d.message || d.status;
+              }
+              if (d.status !== 'error') vitalsStatusEl.style.color = '#888';
+            }).catch(function () {});
+        }, 2000);
 
         transcriptEventSource.onmessage = function (ev) {
           try {
@@ -536,8 +594,10 @@
         streamView.src = '';
         streamView.style.display = 'none';
         facesSection.style.display = 'none';
+        vitalsSection.style.display = 'none';
         transcriptSection.style.display = 'none';
         if (facesPollIntervalId) { clearInterval(facesPollIntervalId); facesPollIntervalId = null; }
+        if (vitalsPollIntervalId) { clearInterval(vitalsPollIntervalId); vitalsPollIntervalId = null; }
         transcriptEl.textContent = '';
         preview.style.display = 'block';
         viewBtn.style.display = 'inline-block';

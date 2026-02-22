@@ -22,6 +22,7 @@ from aiortc.contrib.media import MediaBlackhole
 
 from face import get_last_detected_ids, get_registry, process_frame
 from transcript import add_encoded, add_pcm, get_sse_queue_count, get_sse_queues, push_text
+from vitals import get_vitals_collector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -375,9 +376,15 @@ async def api_frame(request: Request):
         raise HTTPException(status_code=400, detail="Empty or too large")
     _latest_jpeg = await asyncio.to_thread(process_frame, body)
     _frame_event.set()
+    get_vitals_collector().add_frame(body)
     if _http_frame_session_id is None:
         _http_frame_session_id = str(uuid.uuid4())
     return {"session_id": _http_frame_session_id}
+
+
+@app.get("/api/vitals")
+async def api_vitals():
+    return get_vitals_collector().get_latest()
 
 
 @app.post("/api/signal")
