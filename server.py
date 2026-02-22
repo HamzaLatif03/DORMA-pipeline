@@ -14,9 +14,7 @@ import uuid
 import wave
 from pathlib import Path
 
-import cv2
 import httpx
-import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,7 +22,8 @@ from PIL import Image
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaBlackhole
-from deepface import DeepFace
+
+from database import get_last_detected_ids, get_registry, process_frame_faces
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,7 +70,6 @@ _diag_audio_encoded_count: int = 0
 _diag_audio_encoded_last: float = 0
 _diag_audio_pcm_count: int = 0
 _diag_audio_pcm_last: float = 0
-
 
 def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int, channels: int) -> bytes:
     """Convert raw Int16 PCM to WAV format."""
@@ -164,34 +162,6 @@ async def _transcript_encoded_loop():
                 q.put_nowait({"text": text, "interim": False})
             except asyncio.QueueFull:
                 pass
-
-
-def _process_frame_faces(jpeg_bytes: bytes) -> bytes:
-    """Run face detection + emotion on a JPEG frame; draw boxes and labels; return annotated JPEG."""
-    try:
-        nparr = np.frombuffer(jpeg_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return jpeg_bytes
-        analyses = DeepFace.analyze(img, actions=["emotion"], enforce_detection=False, silent=True)
-        if not isinstance(analyses, list):
-            analyses = [analyses]
-        for entry in analyses:
-            region = entry.get("region") or entry.get("facial_area")
-            if not region:
-                continue
-            x = region.get("x", 0)
-            y = region.get("y", 0)
-            w = region.get("w", 0)
-            h = region.get("h", 0)
-            emotion = entry.get("dominant_emotion", "?")
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(img, emotion, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        _, out_buf = cv2.imencode(".jpg", img)
-        return out_buf.tobytes()
-    except Exception as e:
-        logger.debug("Face/emotion processing failed: %s", e)
-        return jpeg_bytes
 
 
 async def _consume_video_track(track):
@@ -516,6 +486,42 @@ async def api_transcript_stream():
     )
 
 
+@app.get("/api/faces")
+async def api_list_faces():
+    """List all registered faces with person_id for database lookup."""
+    registry = get_registry()
+    return {"faces": registry.list_all()}
+
+
+@app.get("/api/faces/detected")
+async def api_faces_detected():
+    """Face IDs from the most recent processed frame. Poll this to display current faces."""
+    return {"person_ids": get_last_detected_ids()}
+
+
+@app.get("/api/faces/{person_id}")
+async def api_get_face(person_id: str):
+    """Get person info by ID. Use this to look up database records."""
+    registry = get_registry()
+    ent = registry.get(person_id)
+    if not ent:
+        raise HTTPException(status_code=404, detail="Person not found")
+    out = dict(ent)
+    out.pop("embedding", None)
+    out.pop("embeddings", None)
+    out["person_id"] = person_id
+    return out
+
+
+@app.patch("/api/faces/{person_id}")
+async def api_update_face(person_id: str, body: dict = Body(default={})):
+    """Update metadata for a person. Store name, notes, etc. for database sync."""
+    registry = get_registry()
+    if not registry.update_metadata(person_id, **body):
+        raise HTTPException(status_code=404, detail="Person not found")
+    return {"ok": True, "person_id": person_id}
+
+
 @app.get("/api/ping")
 async def api_ping():
     """Simple connectivity check. If the iPhone can load this URL, it can reach the server."""
@@ -529,7 +535,7 @@ async def api_frame(request: Request):
     body = await request.body()
     if not body or len(body) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Empty or too large")
-    _latest_jpeg = await asyncio.to_thread(_process_frame_faces, body)
+    _latest_jpeg = await asyncio.to_thread(process_frame_faces, body)
     _frame_event.set()
     if _http_frame_session_id is None:
         _http_frame_session_id = str(uuid.uuid4())

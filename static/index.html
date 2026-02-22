@@ -78,6 +78,10 @@
     <img id="streamView" alt="Live stream" style="display:none; width:100%; max-width:320px; height:240px; object-fit:cover; border-radius:8px; background:#000;">
   </div>
 
+  <div id="facesSection" class="section" style="display:none; background:#252525; padding:0.75rem; border-radius:8px;">
+    <strong style="font-size:0.9rem;">Detected face IDs</strong>
+    <div id="facesDetected" style="font-size:0.9rem; color:#6c6; margin-top:0.5rem; font-family:monospace;">—</div>
+  </div>
   <div id="transcriptSection" class="section" style="display:none; background:#252525; padding:0.75rem; border-radius:8px; max-height:200px; overflow-y:auto;">
     <strong style="font-size:0.9rem;">Live transcript</strong>
     <div id="transcript" style="font-size:0.95rem; color:#ccc; margin-top:0.5rem; white-space:pre-wrap; min-height:1.5em;"></div>
@@ -97,6 +101,8 @@
       const stopViewBtn = document.getElementById('stopViewBtn');
       const preview = document.getElementById('preview');
       const streamView = document.getElementById('streamView');
+      const facesSection = document.getElementById('facesSection');
+      const facesDetectedEl = document.getElementById('facesDetected');
       const transcriptSection = document.getElementById('transcriptSection');
       const transcriptEl = document.getElementById('transcript');
       const statusEl = document.getElementById('status');
@@ -117,6 +123,7 @@
       let audioViewerWs = null;
       let audioEventSource = null;
       let transcriptEventSource = null;
+      let facesPollIntervalId = null;
       let useHttpAudio = false;
       let viewingActive = false;
       let audioContext = null;
@@ -425,6 +432,7 @@
         streamView.src = base + '/stream';
         streamView.style.display = 'block';
         preview.style.display = 'none';
+        facesSection.style.display = 'block';
         transcriptSection.style.display = 'block';
         transcriptEl.textContent = 'Waiting for speech…';
         viewBtn.style.display = 'none';
@@ -437,6 +445,14 @@
         transcriptEventSource = new EventSource(base + '/api/transcript/stream');
         var fixedTranscript = '';
         var pendingInterim = '';
+        facesPollIntervalId = setInterval(function () {
+          fetch(base + '/api/faces/detected').then(function (r) { return r.json(); })
+            .then(function (d) {
+              var ids = d.person_ids || [];
+              facesDetectedEl.textContent = ids.length ? ids.join(', ') : 'No faces detected';
+            }).catch(function () {});
+        }, 1000);
+
         transcriptEventSource.onmessage = function (ev) {
           try {
             const data = JSON.parse(ev.data);
@@ -492,7 +508,9 @@
         viewingActive = false;
         streamView.src = '';
         streamView.style.display = 'none';
+        facesSection.style.display = 'none';
         transcriptSection.style.display = 'none';
+        if (facesPollIntervalId) { clearInterval(facesPollIntervalId); facesPollIntervalId = null; }
         transcriptEl.textContent = '';
         preview.style.display = 'block';
         viewBtn.style.display = 'inline-block';
