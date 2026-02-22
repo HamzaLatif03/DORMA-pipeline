@@ -14,3 +14,5 @@ computer/faces.json
 .idea/
 *.swp
 *.swo
+
+faces.json
