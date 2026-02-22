@@ -3,15 +3,19 @@ FastAPI server: WebRTC signaling over WebSocket, receive A/V from browser,
 push play commands to browser. Relays video as MJPEG for viewers. Serves the web app and audio files.
 """
 import asyncio
+import base64
 import io
 import json
 import logging
 import os
+import struct
 import time
 import uuid
+import wave
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -36,6 +40,19 @@ STATIC_DIR.mkdir(exist_ok=True)
 
 # Connected WebSocket clients (for pushing play commands)
 connected_clients: set[WebSocket] = set()
+
+# Audio relay: broadcast mic audio from broadcaster to viewers
+_audio_connections: set[WebSocket] = set()
+# HTTP fallback for audio (when WebSocket blocked by ngrok): POST chunks, SSE for viewers
+_audio_sse_queues: list[asyncio.Queue[bytes]] = []
+# Transcription: buffer raw PCM, send to ElevenLabs, push transcripts to viewers
+_transcript_pcm_buffer: bytearray = bytearray()
+_transcript_sample_rate: int = 48000
+_transcript_channels: int = 1
+_transcript_sse_queues: list[asyncio.Queue[str]] = []
+_transcript_task: asyncio.Task | None = None
+_transcript_encoded_chunks: list[bytes] = []
+_transcript_encoded_task: asyncio.Task | None = None
 # One peer connection per client (keyed by WebSocket)
 peer_connections: dict[WebSocket, RTCPeerConnection] = {}
 
@@ -49,6 +66,104 @@ _http_broadcaster_session_id: str | None = None
 # HTTP frame upload (iPhone sends JPEGs via POST - works when WebRTC is blocked)
 _http_frame_session_id: str | None = None
 _http_play_commands: list[dict] = []
+# Diagnostics
+_diag_audio_encoded_count: int = 0
+_diag_audio_encoded_last: float = 0
+_diag_audio_pcm_count: int = 0
+_diag_audio_pcm_last: float = 0
+
+
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int, channels: int) -> bytes:
+    """Convert raw Int16 PCM to WAV format."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+async def _transcribe_audio_with_elevenlabs(audio_bytes: bytes, content_type: str = "audio/wav") -> str | None:
+    """Send WAV audio to ElevenLabs Speech-to-Text API. Returns transcript text or None."""
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        logger.debug("ELEVENLABS_API_KEY not set, skipping transcription")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            ext = "wav" if "wav" in content_type else ("mp4" if "mp4" in content_type else "webm")
+            files = {"file": (f"audio.{ext}", audio_bytes, content_type)}
+            data = {"model_id": "scribe_v2"}
+            headers = {"xi-api-key": api_key}
+            resp = await client.post(
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                files=files,
+                data=data,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                logger.warning("ElevenLabs STT error: %s %s", resp.status_code, resp.text[:200])
+                return None
+            out = resp.json()
+            text = ""
+            if isinstance(out, str):
+                text = out
+            elif isinstance(out, dict):
+                text = out.get("text") or out.get("transcript") or out.get("transcription") or ""
+            if text and isinstance(text, str):
+                return text.strip() or None
+            return None
+    except Exception as e:
+        logger.debug("ElevenLabs transcription failed: %s", e)
+        return None
+
+
+async def _transcript_loop():
+    """Background task: buffer PCM, periodically send to ElevenLabs, push transcripts to viewers."""
+    global _transcript_pcm_buffer, _transcript_sample_rate, _transcript_channels
+    # Need ~1.5 seconds of audio for lower latency
+    min_bytes = int(_transcript_sample_rate * 2 * _transcript_channels * 1.5)
+    while True:
+        await asyncio.sleep(1.2)
+        buf = bytes(_transcript_pcm_buffer)
+        if len(buf) < min_bytes:
+            continue
+        _transcript_pcm_buffer.clear()
+        wav_bytes = _pcm_to_wav(buf, _transcript_sample_rate, _transcript_channels)
+        text = await _transcribe_audio_with_elevenlabs(wav_bytes, "audio/wav")
+        if not text:
+            continue
+        for q in _transcript_sse_queues:
+            try:
+                q.put_nowait({"text": text, "interim": False})
+            except asyncio.QueueFull:
+                pass
+
+
+async def _transcript_encoded_loop():
+    """Background task: buffer MediaRecorder chunks (MP4/WebM), periodically send to ElevenLabs."""
+    global _transcript_encoded_chunks
+    while True:
+        await asyncio.sleep(1.2)
+        chunks = list(_transcript_encoded_chunks)
+        if not chunks or sum(len(c) for c in chunks) < 8000:  # min ~0.4 sec
+            continue
+        combined = b"".join(chunks)
+        # Keep first chunk (init segment) for next batch; remove the rest
+        if len(chunks) > 1:
+            _transcript_encoded_chunks[:] = [chunks[0]]
+        else:
+            _transcript_encoded_chunks.clear()
+        content_type = "audio/mp4" if b"ftyp" in combined[:32] else "audio/webm"
+        text = await _transcribe_audio_with_elevenlabs(combined, content_type)
+        if not text:
+            continue
+        for q in _transcript_sse_queues:
+            try:
+                q.put_nowait({"text": text, "interim": False})
+            except asyncio.QueueFull:
+                pass
 
 
 def _process_frame_faces(jpeg_bytes: bytes) -> bytes:
@@ -197,6 +312,207 @@ async def stream_mjpeg():
     return StreamingResponse(
         generate(),
         media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
+
+
+@app.websocket("/ws/audio")
+async def websocket_audio(websocket: WebSocket):
+    """Audio relay: broadcaster sends binary chunks, viewers receive. Broadcasts from sender to all other connections."""
+    await websocket.accept()
+    _audio_connections.add(websocket)
+    logger.info("Audio connection; total=%d", len(_audio_connections))
+    try:
+        while True:
+            msg = await websocket.receive()
+            data = msg.get("bytes")
+            if data and isinstance(data, bytes):
+                # Add to transcript buffer for ElevenLabs
+                if len(data) >= 8 and os.environ.get("ELEVENLABS_API_KEY"):
+                    global _transcript_pcm_buffer, _transcript_sample_rate, _transcript_channels, _transcript_task
+                    sr = struct.unpack_from("<I", data, 0)[0]
+                    ch = struct.unpack_from("<I", data, 4)[0] or 1
+                    if sr and 8000 <= sr <= 96000:
+                        _transcript_sample_rate = sr
+                        _transcript_channels = ch
+                    _transcript_pcm_buffer.extend(data[8:])
+                    if len(_transcript_pcm_buffer) > 600000:
+                        _transcript_pcm_buffer = _transcript_pcm_buffer[-300000:]
+                    if _transcript_task is None:
+                        _transcript_task = asyncio.create_task(_transcript_loop())
+                dead = set()
+                for ws in _audio_connections:
+                    if ws is not websocket:
+                        try:
+                            await ws.send_bytes(data)
+                        except Exception:
+                            dead.add(ws)
+                for ws in dead:
+                    _audio_connections.discard(ws)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug("Audio WebSocket error: %s", e)
+    finally:
+        _audio_connections.discard(websocket)
+        logger.info("Audio connection closed; total=%d", len(_audio_connections))
+
+
+@app.get("/api/diagnostic")
+async def api_diagnostic():
+    """Diagnostic: check if server is receiving audio."""
+    return {
+        "audio_encoded_received": _diag_audio_encoded_count,
+        "audio_encoded_last_sec_ago": round(time.time() - _diag_audio_encoded_last, 1) if _diag_audio_encoded_last else None,
+        "audio_pcm_received": _diag_audio_pcm_count,
+        "audio_pcm_last_sec_ago": round(time.time() - _diag_audio_pcm_last, 1) if _diag_audio_pcm_last else None,
+        "audio_ws_connections": len(_audio_connections),
+        "audio_sse_viewers": len(_audio_sse_queues),
+        "transcript_sse_viewers": len(_transcript_sse_queues),
+    }
+
+
+@app.post("/api/audio/encoded")
+@app.post("/api/audio-encoded")  # Alias in case path/proxy strips trailing segment
+async def api_audio_encoded(request: Request):
+    """Accept MediaRecorder chunks (MP4/WebM) from broadcaster. Used on iOS Safari where ScriptProcessorNode fails."""
+    global _transcript_encoded_chunks, _transcript_encoded_task, _diag_audio_encoded_count, _diag_audio_encoded_last
+    body = await request.body()
+    if not body or len(body) < 4 or len(body) > 2 * 1024 * 1024:
+        return {"ok": False}
+    # Detect MP4 (ftyp at offset 4) or WebM (EBML 0x1A45DFA3)
+    is_mp4 = len(body) >= 8 and body[4:8] == b"ftyp"
+    is_webm = len(body) >= 4 and body[0:4] == bytes([0x1A, 0x45, 0xDF, 0xA3])
+    if not (is_mp4 or is_webm):
+        if _diag_audio_encoded_count < 3:  # Log first few rejections
+            logger.info("Audio encoded: rejected (not mp4/webm), len=%d, first16=%s", len(body), body[:16].hex() if len(body) >= 16 else (body.hex() if body else ""))
+        return {"ok": False}
+    _diag_audio_encoded_count += 1
+    _diag_audio_encoded_last = time.time()
+    # Relay to Mac viewers for playback (WebSocket + SSE)
+    dead = set()
+    for ws in _audio_connections:
+        try:
+            await ws.send_bytes(body)
+        except Exception:
+            dead.add(ws)
+    for ws in dead:
+        _audio_connections.discard(ws)
+    for q in _audio_sse_queues:
+        try:
+            q.put_nowait(body)
+        except asyncio.QueueFull:
+            pass
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        _transcript_encoded_chunks.append(body)
+        while sum(len(c) for c in _transcript_encoded_chunks) > 500000:  # ~10 sec max
+            _transcript_encoded_chunks.pop(0)
+        if _transcript_encoded_task is None:
+            _transcript_encoded_task = asyncio.create_task(_transcript_encoded_loop())
+    return {"ok": True}
+
+
+@app.post("/api/audio")
+async def api_audio(request: Request):
+    """HTTP fallback: accept raw PCM chunks from broadcaster. Used when WebSocket is blocked (e.g. ngrok)."""
+    global _transcript_pcm_buffer, _transcript_sample_rate, _transcript_channels, _transcript_task, _diag_audio_pcm_count, _diag_audio_pcm_last
+    body = await request.body()
+    if not body or len(body) < 8 or len(body) > 256 * 1024:
+        return {"ok": False}
+    _diag_audio_pcm_count += 1
+    _diag_audio_pcm_last = time.time()
+    # Add to transcript buffer (8-byte header: sample_rate uint32, channels uint32; rest is PCM)
+    if len(body) >= 8 and os.environ.get("ELEVENLABS_API_KEY"):
+        sr = struct.unpack_from("<I", body, 0)[0]
+        ch = struct.unpack_from("<I", body, 4)[0] or 1
+        if sr and 8000 <= sr <= 96000:
+            _transcript_sample_rate = sr
+            _transcript_channels = ch
+        _transcript_pcm_buffer.extend(body[8:])
+        if len(_transcript_pcm_buffer) > 600000:  # cap at ~6 sec
+            _transcript_pcm_buffer = _transcript_pcm_buffer[-300000:]
+        if _transcript_task is None:
+            _transcript_task = asyncio.create_task(_transcript_loop())
+    # Broadcast to WebSocket viewers
+    dead = set()
+    for ws in _audio_connections:
+        try:
+            await ws.send_bytes(body)
+        except Exception:
+            dead.add(ws)
+    for ws in dead:
+        _audio_connections.discard(ws)
+    # Push to SSE viewers
+    for q in _audio_sse_queues:
+        try:
+            q.put_nowait(body)
+        except asyncio.QueueFull:
+            pass
+    return {"ok": True}
+
+
+@app.get("/api/audio/stream")
+async def api_audio_stream():
+    """SSE fallback: stream audio chunks to viewer. Used when WebSocket is blocked (e.g. ngrok)."""
+
+    async def generate():
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=30)
+        _audio_sse_queues.append(q)
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=30.0)
+                    b64 = base64.b64encode(chunk).decode("ascii")
+                    yield f"data: {b64}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            _audio_sse_queues.remove(q)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/api/transcript")
+async def api_transcript(body: dict = Body(default={})):
+    """Accept transcript text from broadcaster (e.g. Web Speech API on iPhone). Pushes to transcript SSE viewers."""
+    text = (body.get("text") or body.get("transcript") or "").strip()
+    if not text:
+        return {"ok": False}
+    interim = body.get("interim", False)
+    msg = {"text": text, "interim": interim}
+    for q in _transcript_sse_queues:
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
+    return {"ok": True}
+
+
+@app.get("/api/transcript/stream")
+async def api_transcript_stream():
+    """SSE stream of live transcripts (from Web Speech API or ElevenLabs)."""
+
+    async def generate():
+        q: asyncio.Queue = asyncio.Queue(maxsize=100)
+        _transcript_sse_queues.append(q)
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=60.0)
+                    payload = json.dumps(msg) if isinstance(msg, dict) else json.dumps({"text": msg, "interim": False})
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            _transcript_sse_queues.remove(q)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 

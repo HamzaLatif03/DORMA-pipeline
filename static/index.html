@@ -78,7 +78,15 @@
     <img id="streamView" alt="Live stream" style="display:none; width:100%; max-width:320px; height:240px; object-fit:cover; border-radius:8px; background:#000;">
   </div>
 
+  <div id="transcriptSection" class="section" style="display:none; background:#252525; padding:0.75rem; border-radius:8px; max-height:200px; overflow-y:auto;">
+    <strong style="font-size:0.9rem;">Live transcript</strong>
+    <div id="transcript" style="font-size:0.95rem; color:#ccc; margin-top:0.5rem; white-space:pre-wrap; min-height:1.5em;"></div>
+  </div>
+
   <div id="status">Enter server URL and tap Connect.</div>
+  <div id="audioStatus" style="font-size:0.8rem; color:#888; margin-top:0.25rem; min-height:1.2em;"></div>
+  <button id="diagnosticBtn" type="button" class="secondary" style="margin-top:0.5rem; font-size:0.85rem;">Check audio diagnostic</button>
+  <pre id="diagnosticResult" style="display:none; font-size:0.75rem; background:#222; padding:0.5rem; border-radius:4px; overflow:auto; max-height:120px;"></pre>
 
   <script>
     (function () {
@@ -89,13 +97,31 @@
       const stopViewBtn = document.getElementById('stopViewBtn');
       const preview = document.getElementById('preview');
       const streamView = document.getElementById('streamView');
+      const transcriptSection = document.getElementById('transcriptSection');
+      const transcriptEl = document.getElementById('transcript');
       const statusEl = document.getElementById('status');
+      const audioStatusEl = document.getElementById('audioStatus');
+      const diagnosticBtn = document.getElementById('diagnosticBtn');
+      const diagnosticResult = document.getElementById('diagnosticResult');
 
       let ws = null;
       let pc = null;
       let localStream = null;
       let pollIntervalId = null;
       let frameIntervalId = null;
+      let audioWs = null;
+      let audioCaptureCtx = null;
+      let audioProcessor = null;
+      let mediaRecorder = null;
+      let speechRecognition = null;
+      let audioViewerWs = null;
+      let audioEventSource = null;
+      let transcriptEventSource = null;
+      let useHttpAudio = false;
+      let viewingActive = false;
+      let audioContext = null;
+      let audioQueue = [];
+      let audioPlaying = false;
       const audioEl = new Audio();
 
       function setStatus(msg, isError) {
@@ -114,6 +140,11 @@
         return (base.replace(/^http/, 'ws') + '/ws');
       }
 
+      function getAudioWsUrl() {
+        const base = getBaseUrl();
+        return (base.replace(/^http/, 'ws') + '/ws/audio');
+      }
+
       async function startCapture() {
         if (localStream) return localStream;
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -130,6 +161,10 @@
         }
         setStatus('Starting camera…');
         const base = getBaseUrl();
+        var audioCtxPreCreate = null;
+        if (window.AudioContext || window.webkitAudioContext) {
+          audioCtxPreCreate = new (window.AudioContext || window.webkitAudioContext)();
+        }
         try {
           const stream = await startCapture();
           setStatus('Camera on. Sending video to Mac…');
@@ -172,6 +207,120 @@
           }
           frameIntervalId = setInterval(sendFrame, 200);
           sendFrame();
+
+          // Transcription: Web Speech API (works on iOS Safari - no audio streaming needed)
+          var SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (SpeechRec && stream.getAudioTracks().length) {
+            try {
+              speechRecognition = new SpeechRec();
+              speechRecognition.continuous = true;
+              speechRecognition.interimResults = true;
+              speechRecognition.lang = 'en-US';
+              var lastInterimSent = 0;
+              speechRecognition.onresult = function (ev) {
+                var text = '';
+                for (var i = ev.resultIndex; i < ev.results.length; i++) {
+                  text += ev.results[i][0].transcript;
+                  var isFinal = ev.results[i].isFinal;
+                  var t = text.trim();
+                  if (!t) continue;
+                  if (isFinal) {
+                    fetch(base + '/api/transcript', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: t, interim: false }) }).catch(function () {});
+                    text = '';
+                  } else {
+                    if (Date.now() - lastInterimSent > 250) {
+                      lastInterimSent = Date.now();
+                      fetch(base + '/api/transcript', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: t, interim: true }) }).catch(function () {});
+                    }
+                  }
+                }
+              };
+              speechRecognition.onerror = function () {};
+              speechRecognition.onend = function () {
+                if (speechRecognition && localStream) try { speechRecognition.start(); } catch (e) {}
+              };
+              speechRecognition.start();
+              setStatus('Streaming to Mac (video + live transcripts). View on Mac and tap View stream.');
+            } catch (e) {}
+          }
+
+          // Audio: MediaRecorder (for playback + ElevenLabs); ScriptProcessorNode fallback
+          const audioTracks = stream.getAudioTracks();
+          var audioChunksSent = 0;
+          if (audioTracks.length) {
+            var useMediaRecorder = false;
+            if (window.MediaRecorder) {
+              var mime = '';
+              if (navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome')) {
+                mime = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
+              } else {
+                mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+              }
+              try {
+                mediaRecorder = mime ? new MediaRecorder(new MediaStream(audioTracks), { mimeType: mime })
+                  : new MediaRecorder(new MediaStream(audioTracks));
+                mediaRecorder.ondataavailable = function (ev) {
+                  if (ev.data && ev.data.size > 0) {
+                    audioChunksSent++;
+                    audioStatusEl.textContent = 'Audio: sent ' + audioChunksSent + ' chunks';
+                    fetch(base + '/api/audio/encoded', { method: 'POST', body: ev.data })
+                      .then(function(r) { if (!r.ok) audioStatusEl.textContent = 'Audio: POST failed ' + r.status; })
+                      .catch(function(e) { audioStatusEl.textContent = 'Audio: POST error ' + (e.message || 'network'); });
+                  }
+                };
+                mediaRecorder.onerror = function (e) { audioStatusEl.textContent = 'Audio: MediaRecorder error'; };
+                mediaRecorder.start(1000);
+                useMediaRecorder = true;
+                audioStatusEl.textContent = 'Audio: MediaRecorder started (' + (mime || 'default') + ')';
+                setStatus('Streaming to Mac (video + audio). View on Mac and tap View stream.');
+              } catch (e) {
+                audioStatusEl.textContent = 'Audio: MediaRecorder failed - ' + (e.message || 'unknown');
+              }
+            }
+            if (!useMediaRecorder) {
+              audioStatusEl.textContent = audioStatusEl.textContent || 'Audio: MediaRecorder not used, trying PCM...';
+              if (audioCaptureCtx = audioCtxPreCreate || new (window.AudioContext || window.webkitAudioContext)()) {
+              var sendAudioChunk = function (buf) {
+                if (audioWs && audioWs.readyState === WebSocket.OPEN) {
+                  try { audioWs.send(buf.buffer); } catch (err) {}
+                } else if (useHttpAudio) {
+                  fetch(base + '/api/audio', { method: 'POST', body: buf }).catch(function () {});
+                }
+              };
+              var startAudioPipeline = function () {
+                if (audioProcessor) return;
+                const src = audioCaptureCtx.createMediaStreamSource(new MediaStream(audioTracks));
+                audioProcessor = audioCaptureCtx.createScriptProcessor(4096, 1, 1);
+                src.connect(audioProcessor);
+                audioProcessor.connect(audioCaptureCtx.createGain());
+                audioProcessor.onaudioprocess = function (e) {
+                  const input = e.inputBuffer.getChannelData(0);
+                  const pcm = new Int16Array(input.length);
+                  for (var i = 0; i < input.length; i++)
+                    pcm[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+                  const header = new ArrayBuffer(8);
+                  new DataView(header).setUint32(0, audioCaptureCtx.sampleRate, true);
+                  new DataView(header).setUint32(4, 1, true);
+                  const buf = new Uint8Array(8 + pcm.byteLength);
+                  buf.set(new Uint8Array(header));
+                  buf.set(new Uint8Array(pcm.buffer), 8);
+                  sendAudioChunk(buf);
+                };
+              };
+              audioWs = new WebSocket(getAudioWsUrl());
+              audioWs.binaryType = 'arraybuffer';
+              audioWs.onopen = function () { useHttpAudio = false; startAudioPipeline(); };
+              audioWs.onerror = function () { useHttpAudio = true; if (!audioProcessor) startAudioPipeline(); };
+              audioWs.onclose = function () { useHttpAudio = true; if (!audioProcessor) startAudioPipeline(); };
+              setTimeout(function () {
+                if (!audioProcessor) { useHttpAudio = true; if (audioWs) audioWs.close(); startAudioPipeline(); audioStatusEl.textContent = 'Audio: PCM pipeline (WebSocket/HTTP)'; }
+              }, 2500);
+              }
+            }
+            if (!useMediaRecorder && !audioProcessor) audioStatusEl.textContent = 'Audio: no capture (no MediaRecorder, no PCM)';
+          } else {
+            audioStatusEl.textContent = 'Audio: no mic tracks - allow microphone access';
+          }
         } catch (err) {
           var msg = err.message || String(err);
           if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
@@ -185,6 +334,25 @@
       }
 
       function disconnect() {
+        audioStatusEl.textContent = '';
+        if (speechRecognition) {
+          try { speechRecognition.stop(); } catch (e) {}
+          speechRecognition = null;
+        }
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+          mediaRecorder = null;
+        }
+        if (audioProcessor && audioCaptureCtx) {
+          try { audioProcessor.disconnect(); } catch (e) {}
+          try { audioCaptureCtx.close(); } catch (e) {}
+          audioProcessor = null;
+          audioCaptureCtx = null;
+        }
+        if (audioWs) {
+          audioWs.close();
+          audioWs = null;
+        }
         if (frameIntervalId) {
           clearInterval(frameIntervalId);
           frameIntervalId = null;
@@ -210,24 +378,140 @@
         disconnectBtn.disabled = true;
       }
 
+      function playNextAudioBuffer() {
+        if (audioQueue.length === 0) { audioPlaying = false; return; }
+        audioPlaying = true;
+        const buf = audioQueue.shift();
+        const ctx = audioContext || (audioContext = new (window.AudioContext || window.webkitAudioContext)());
+        if (ctx.state === 'suspended') ctx.resume();
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.onended = playNextAudioBuffer;
+        src.start(0);
+      }
+
+      function playPcmChunk(data) {
+        if (!(data instanceof ArrayBuffer) && !(data instanceof Uint8Array)) return;
+        const arr = data instanceof Uint8Array ? data : new Uint8Array(data);
+        if (arr.length < 4) return;
+        const ctx = audioContext || (audioContext = new (window.AudioContext || window.webkitAudioContext)());
+        if (ctx.state === 'suspended') ctx.resume();
+        var isEncoded = (arr.length >= 8 && arr[4] === 0x66 && arr[5] === 0x74 && arr[6] === 0x79 && arr[7] === 0x70) ||
+          (arr[0] === 0x1A && arr[1] === 0x45 && arr[2] === 0xDF && arr[3] === 0xA3);
+        if (isEncoded) {
+          ctx.decodeAudioData(arr.buffer.slice(arr.byteOffset, arr.byteOffset + arr.byteLength))
+            .then(function (buf) { audioQueue.push(buf); if (!audioPlaying) playNextAudioBuffer(); })
+            .catch(function () {});
+          return;
+        }
+        if (arr.length < 8) return;
+        const view = new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+        const sampleRate = view.getUint32(0, true);
+        const channels = view.getUint32(4, true) || 1;
+        const pcmLen = arr.length - 8;
+        if (pcmLen < 2) return;
+        const buf = ctx.createBuffer(channels, pcmLen / 2 / channels, sampleRate);
+        const int16 = new Int16Array(arr.buffer, arr.byteOffset + 8, pcmLen / 2);
+        const out = buf.getChannelData(0);
+        for (var i = 0; i < int16.length; i++) out[i] = int16[i] / 32768;
+        audioQueue.push(buf);
+        if (!audioPlaying) playNextAudioBuffer();
+      }
+
       function startViewing() {
+        viewingActive = true;
         const base = getBaseUrl();
         streamView.src = base + '/stream';
         streamView.style.display = 'block';
         preview.style.display = 'none';
+        transcriptSection.style.display = 'block';
+        transcriptEl.textContent = 'Waiting for speech…';
         viewBtn.style.display = 'none';
         stopViewBtn.style.display = 'inline-block';
         stopViewBtn.disabled = false;
         setStatus('Viewing stream from server. Use another device (e.g. iPhone) as the camera.');
+
+        // Transcript: ElevenLabs Speech-to-Text live transcript
+        if (transcriptEventSource) transcriptEventSource.close();
+        transcriptEventSource = new EventSource(base + '/api/transcript/stream');
+        var fixedTranscript = '';
+        var pendingInterim = '';
+        transcriptEventSource.onmessage = function (ev) {
+          try {
+            const data = JSON.parse(ev.data);
+            const t = (data.text || '').trim();
+            if (!t) return;
+            const interim = !!data.interim;
+            if (interim) {
+              pendingInterim = t;
+            } else {
+              fixedTranscript = (fixedTranscript ? fixedTranscript + ' ' : '') + t;
+              pendingInterim = '';
+            }
+            transcriptEl.textContent = fixedTranscript + (pendingInterim ? ' ' + pendingInterim : '') || 'Waiting for speech…';
+          } catch (e) {}
+        };
+
+        // Audio: try WebSocket first, fallback to SSE (works when ngrok blocks WebSocket)
+        if (audioViewerWs && audioViewerWs.readyState === WebSocket.OPEN) return;
+        if (audioEventSource && audioEventSource.readyState === EventSource.OPEN) return;
+
+        var sseStarted = false;
+        function startSseAudio() {
+          if (sseStarted || (audioEventSource && audioEventSource.readyState === EventSource.OPEN)) return;
+          sseStarted = true;
+          audioEventSource = new EventSource(base + '/api/audio/stream');
+          audioEventSource.onmessage = function (ev) {
+            try {
+              const binary = atob(ev.data);
+              const bytes = new Uint8Array(binary.length);
+              for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              playPcmChunk(bytes);
+            } catch (e) {}
+          };
+        }
+        audioViewerWs = new WebSocket(getAudioWsUrl());
+        audioViewerWs.binaryType = 'arraybuffer';
+        audioViewerWs.onmessage = function (ev) {
+          if (ev.data instanceof ArrayBuffer && ev.data.byteLength >= 8)
+            playPcmChunk(ev.data);
+        };
+        audioViewerWs.onclose = function () {
+          if (viewingActive) startSseAudio();
+        };
+        audioViewerWs.onerror = function () { audioViewerWs.close(); };
+        setTimeout(function () {
+          if (audioViewerWs && audioViewerWs.readyState === WebSocket.CONNECTING) {
+            audioViewerWs.close();
+          }
+        }, 3000);
       }
 
       function stopViewing() {
+        viewingActive = false;
         streamView.src = '';
         streamView.style.display = 'none';
+        transcriptSection.style.display = 'none';
+        transcriptEl.textContent = '';
         preview.style.display = 'block';
         viewBtn.style.display = 'inline-block';
         stopViewBtn.style.display = 'none';
         stopViewBtn.disabled = true;
+        if (transcriptEventSource) {
+          transcriptEventSource.close();
+          transcriptEventSource = null;
+        }
+        if (audioViewerWs) {
+          audioViewerWs.close();
+          audioViewerWs = null;
+        }
+        if (audioEventSource) {
+          audioEventSource.close();
+          audioEventSource = null;
+        }
+        audioQueue = [];
+        audioPlaying = false;
         setStatus('Stopped viewing.');
       }
 
@@ -239,6 +523,18 @@
       disconnectBtn.onclick = disconnect;
       viewBtn.onclick = startViewing;
       stopViewBtn.onclick = stopViewing;
+      diagnosticBtn.onclick = function () {
+        fetch(getBaseUrl() + '/api/diagnostic')
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            diagnosticResult.textContent = JSON.stringify(d, null, 2);
+            diagnosticResult.style.display = 'block';
+          })
+          .catch(function (e) {
+            diagnosticResult.textContent = 'Error: ' + (e.message || 'network');
+            diagnosticResult.style.display = 'block';
+          });
+      };
 
       // Pre-fill server URL when on same host (e.g. desktop test)
       if (!serverUrlInput.value && location.host)
