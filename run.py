@@ -375,16 +375,6 @@ async def api_frame(request: Request):
         raise HTTPException(status_code=400, detail="Empty or too large")
     _latest_jpeg = await asyncio.to_thread(process_frame, body)
     _frame_event.set()
-
-    nparr = np.frombuffer(body, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-    if len(faces) > 0:
-        pass
-
     if _http_frame_session_id is None:
         _http_frame_session_id = str(uuid.uuid4())
     return {"session_id": _http_frame_session_id}
