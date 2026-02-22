@@ -1,18 +1,17 @@
 """
-FastAPI server: WebRTC signaling over WebSocket, receive A/V from browser,
-push play commands to browser. Relays video as MJPEG for viewers. Serves the web app and audio files.
+FastAPI server: WebRTC signaling, video relay, face recognition, audio/transcript.
 """
 import asyncio
+import base64
 import io
 import json
 import logging
 import os
+import struct
 import time
 import uuid
 from pathlib import Path
 
-import cv2
-import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,76 +19,61 @@ from PIL import Image
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaBlackhole
-from deepface import DeepFace
+
+from face import get_last_detected_ids, get_registry, process_frame
+from transcript import add_encoded, add_pcm, get_sse_queue_count, get_sse_queues, push_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="iPhone peripherals bridge")
 
-# Directory for uploaded/streamed media and for serving audio
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "audio"
 STATIC_DIR = BASE_DIR / "static"
 AUDIO_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
 
-# Connected WebSocket clients (for pushing play commands)
+# -----------------------------------------------------------------------------
+# State
+# -----------------------------------------------------------------------------
 connected_clients: set[WebSocket] = set()
-# One peer connection per client (keyed by WebSocket)
 peer_connections: dict[WebSocket, RTCPeerConnection] = {}
-
-# Video relay: latest JPEG from broadcaster for MJPEG /stream
+_audio_connections: set[WebSocket] = set()
 _latest_jpeg: bytes | None = None
 _frame_event = asyncio.Event()
-
-# HTTP signaling fallback (when WebSocket is blocked)
 _http_broadcaster_pc: RTCPeerConnection | None = None
 _http_broadcaster_session_id: str | None = None
-# HTTP frame upload (iPhone sends JPEGs via POST - works when WebRTC is blocked)
 _http_frame_session_id: str | None = None
 _http_play_commands: list[dict] = []
+_audio_sse_queues: list[asyncio.Queue] = []
+_diag_audio_encoded_count: int = 0
+_diag_audio_encoded_last: float = 0
+_diag_audio_pcm_count: int = 0
+_diag_audio_pcm_last: float = 0
 
+# -----------------------------------------------------------------------------
+# Video
+# -----------------------------------------------------------------------------
 
-def _process_frame_faces(jpeg_bytes: bytes) -> bytes:
-    """Run face detection + emotion on a JPEG frame; draw boxes and labels; return annotated JPEG."""
-    try:
-        nparr = np.frombuffer(jpeg_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return jpeg_bytes
-        analyses = DeepFace.analyze(img, actions=["emotion"], enforce_detection=False, silent=True)
-        if not isinstance(analyses, list):
-            analyses = [analyses]
-        for entry in analyses:
-            region = entry.get("region") or entry.get("facial_area")
-            if not region:
-                continue
-            x = region.get("x", 0)
-            y = region.get("y", 0)
-            w = region.get("w", 0)
-            h = region.get("h", 0)
-            emotion = entry.get("dominant_emotion", "?")
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(img, emotion, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        _, out_buf = cv2.imencode(".jpg", img)
-        return out_buf.tobytes()
-    except Exception as e:
-        logger.debug("Face/emotion processing failed: %s", e)
-        return jpeg_bytes
-
+def _on_video_track(track):
+    if track.kind == "video":
+        asyncio.ensure_future(_consume_video_track(track))
+    else:
+        bh = MediaBlackhole()
+        bh.addTrack(track)
+        asyncio.ensure_future(bh.start())
 
 async def _consume_video_track(track):
-    """Read video frames from the WebRTC track, encode as JPEG, update global for /stream."""
     global _latest_jpeg
     try:
         while True:
             frame = await track.recv()
             try:
-                try:
-                    nd = frame.to_ndarray(format="rgb24")
-                except Exception:
-                    nd = frame.to_ndarray()
+                nd = frame.to_ndarray(format="rgb24") if hasattr(frame, "to_ndarray") else frame.to_ndarray()
                 img = Image.fromarray(nd)
                 buf = io.BytesIO()
                 img.save(buf, "JPEG", quality=85)
@@ -101,6 +85,11 @@ async def _consume_video_track(track):
         logger.info("Video track ended: %s", e)
 
 
+# -----------------------------------------------------------------------------
+# WebSocket / Signaling
+# -----------------------------------------------------------------------------
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -109,60 +98,51 @@ async def websocket_endpoint(websocket: WebSocket):
 
     def on_track(track):
         logger.info("Received %s track", track.kind)
-        if track.kind == "video":
-            asyncio.ensure_future(_consume_video_track(track))
-        else:
-            blackhole = MediaBlackhole()
-            blackhole.addTrack(track)
-            asyncio.ensure_future(blackhole.start())
+        _on_video_track(track)
 
     try:
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
             msg_type = msg.get("type")
+            if msg_type != "offer":
+                continue
+            sdp = msg.get("sdp")
+            if not sdp:
+                logger.warning("Offer missing sdp")
+                continue
+            logger.info("Received offer, creating answer...")
+            try:
+                offer = RTCSessionDescription(sdp=sdp, type="offer")
+                pc = RTCPeerConnection()
+                peer_connections[websocket] = pc
+                pc.on("track", on_track)
 
-            if msg_type == "offer":
-                sdp = msg.get("sdp")
-                if not sdp:
-                    logger.warning("Offer missing sdp")
-                    continue
-                logger.info("Received offer, creating answer...")
-                try:
-                    offer = RTCSessionDescription(sdp=sdp, type="offer")
-                    pc = RTCPeerConnection()
-                    peer_connections[websocket] = pc
-                    pc.on("track", on_track)
-
-                    @pc.on("connectionstatechange")
-                    async def on_connectionstatechange():
-                        if pc.connectionState == "failed" or pc.connectionState == "closed":
-                            await pc.close()
-                            peer_connections.pop(websocket, None)
-
-                    await pc.setRemoteDescription(offer)
-                    answer = await pc.createAnswer()
-                    await pc.setLocalDescription(answer)
-                    deadline = time.monotonic() + 5.0
-                    while pc.iceGatheringState != "complete":
-                        if time.monotonic() > deadline:
-                            logger.warning("ICE gathering timeout, sending answer anyway")
-                            break
-                        await asyncio.sleep(0.1)
-                    await websocket.send_json({
-                        "type": "answer",
-                        "sdp": pc.localDescription.sdp,
-                    })
-                    logger.info("Sent WebRTC answer to client")
-                except Exception as e:
-                    logger.exception("WebRTC offer handling failed: %s", e)
-                    try:
-                        await websocket.send_json({"type": "error", "message": str(e)})
-                    except Exception:
-                        pass
-                    if pc and websocket in peer_connections:
+                @pc.on("connectionstatechange")
+                async def on_connectionstatechange():
+                    if pc.connectionState in ("failed", "closed"):
                         await pc.close()
                         peer_connections.pop(websocket, None)
+
+                await pc.setRemoteDescription(offer)
+                answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                deadline = time.monotonic() + 5.0
+                while pc.iceGatheringState != "complete":
+                    if time.monotonic() > deadline:
+                        logger.warning("ICE gathering timeout")
+                        break
+                    await asyncio.sleep(0.1)
+                await websocket.send_json({"type": "answer", "sdp": pc.localDescription.sdp})
+            except Exception as e:
+                logger.exception("WebRTC offer handling failed: %s", e)
+                try:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+                except Exception:
+                    pass
+                if pc and websocket in peer_connections:
+                    await pc.close()
+                    peer_connections.pop(websocket, None)
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -176,7 +156,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/stream")
 async def stream_mjpeg():
-    """Stream the latest video from the broadcaster as MJPEG. Viewers use this in an img or video tag."""
     boundary = "frame"
 
     async def generate():
@@ -189,10 +168,9 @@ async def stream_mjpeg():
                 yield (
                     b"--" + boundary.encode() + b"\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-                    + jpeg + b"\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n"
                 )
-            await asyncio.sleep(0)  # yield control
+            await asyncio.sleep(0)
 
     return StreamingResponse(
         generate(),
@@ -200,20 +178,202 @@ async def stream_mjpeg():
     )
 
 
-@app.get("/api/ping")
-async def api_ping():
-    """Simple connectivity check. If the iPhone can load this URL, it can reach the server."""
+# -----------------------------------------------------------------------------
+# Audio
+# -----------------------------------------------------------------------------
+
+async def _broadcast_audio(body: bytes):
+    dead = set()
+    for ws in _audio_connections:
+        try:
+            await ws.send_bytes(body)
+        except Exception:
+            dead.add(ws)
+    for ws in dead:
+        _audio_connections.discard(ws)
+    for q in _audio_sse_queues:
+        try:
+            q.put_nowait(body)
+        except asyncio.QueueFull:
+            pass
+
+@app.websocket("/ws/audio")
+async def websocket_audio(websocket: WebSocket):
+    await websocket.accept()
+    _audio_connections.add(websocket)
+    try:
+        while True:
+            msg = await websocket.receive()
+            data = msg.get("bytes")
+            if data and isinstance(data, bytes):
+                if len(data) >= 8 and os.environ.get("ELEVENLABS_API_KEY"):
+                    sr = struct.unpack_from("<I", data, 0)[0]
+                    ch = struct.unpack_from("<I", data, 4)[0] or 1
+                    add_pcm(data[8:], sr, ch)
+                dead = set()
+                for ws in _audio_connections:
+                    if ws is websocket:
+                        continue
+                    try:
+                        await ws.send_bytes(data)
+                    except Exception:
+                        dead.add(ws)
+                for ws in dead:
+                    _audio_connections.discard(ws)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _audio_connections.discard(websocket)
+
+
+@app.post("/api/audio/encoded")
+async def api_audio_encoded(request: Request):
+    global _diag_audio_encoded_count, _diag_audio_encoded_last
+    body = await request.body()
+    if not body or len(body) < 4 or len(body) > 2 * 1024 * 1024:
+        return {"ok": False}
+    is_mp4 = len(body) >= 8 and body[4:8] == b"ftyp"
+    is_webm = len(body) >= 4 and body[0:4] == bytes([0x1A, 0x45, 0xDF, 0xA3])
+    if not (is_mp4 or is_webm):
+        return {"ok": False}
+    _diag_audio_encoded_count += 1
+    _diag_audio_encoded_last = time.time()
+    await _broadcast_audio(body)
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        add_encoded(body)
     return {"ok": True}
+
+
+@app.post("/api/audio")
+async def api_audio(request: Request):
+    global _diag_audio_pcm_count, _diag_audio_pcm_last
+    body = await request.body()
+    if not body or len(body) < 8 or len(body) > 256 * 1024:
+        return {"ok": False}
+    _diag_audio_pcm_count += 1
+    _diag_audio_pcm_last = time.time()
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        sr = struct.unpack_from("<I", body, 0)[0]
+        ch = struct.unpack_from("<I", body, 4)[0] or 1
+        add_pcm(body[8:], sr, ch)
+    await _broadcast_audio(body)
+    return {"ok": True}
+
+
+@app.get("/api/audio/stream")
+async def api_audio_stream():
+    async def generate():
+        q = asyncio.Queue(maxsize=30)
+        _audio_sse_queues.append(q)
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield f"data: {base64.b64encode(chunk).decode('ascii')}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            try:
+                _audio_sse_queues.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+# -----------------------------------------------------------------------------
+# Transcript
+# -----------------------------------------------------------------------------
+
+
+@app.post("/api/transcript")
+async def api_transcript(body: dict = Body(default={})):
+    text = (body.get("text") or body.get("transcript") or "").strip()
+    if not text:
+        return {"ok": False}
+    push_text(text, body.get("interim", False))
+    return {"ok": True}
+
+
+@app.get("/api/transcript/stream")
+async def api_transcript_stream():
+    async def generate():
+        q = asyncio.Queue(maxsize=100)
+        get_sse_queues().append(q)
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=60.0)
+                    payload = json.dumps(msg if isinstance(msg, dict) else {"text": msg, "interim": False})
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            try:
+                get_sse_queues().remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+# -----------------------------------------------------------------------------
+# Face API
+# -----------------------------------------------------------------------------
+
+
+@app.get("/api/faces")
+async def api_list_faces():
+    return {"faces": get_registry().list_all()}
+
+
+@app.get("/api/faces/detected")
+async def api_faces_detected():
+    return {"person_ids": get_last_detected_ids()}
+
+
+@app.get("/api/faces/{person_id}")
+async def api_get_face(person_id: str):
+    ent = get_registry().get(person_id)
+    if not ent:
+        raise HTTPException(status_code=404, detail="Person not found")
+    out = {k: v for k, v in ent.items() if k not in ("embedding", "embeddings")}
+    out["person_id"] = person_id
+    return out
+
+
+@app.patch("/api/faces/{person_id}")
+async def api_update_face(person_id: str, body: dict = Body(default={})):
+    if not get_registry().update_metadata(person_id, **body):
+        raise HTTPException(status_code=404, detail="Person not found")
+    return {"ok": True, "person_id": person_id}
+
+
+@app.get("/api/diagnostic")
+async def api_diagnostic():
+    return {
+        "audio_encoded_received": _diag_audio_encoded_count,
+        "audio_encoded_last_sec_ago": round(time.time() - _diag_audio_encoded_last, 1) if _diag_audio_encoded_last else None,
+        "audio_pcm_received": _diag_audio_pcm_count,
+        "audio_pcm_last_sec_ago": round(time.time() - _diag_audio_pcm_last, 1) if _diag_audio_pcm_last else None,
+        "audio_ws_connections": len(_audio_connections),
+        "transcript_sse_viewers": get_sse_queue_count(),
+        "audio_sse_viewers": len(_audio_sse_queues),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Frame upload & HTTP signaling
+# -----------------------------------------------------------------------------
 
 
 @app.post("/api/frame")
 async def api_frame(request: Request):
-    """Accept a JPEG frame from the broadcaster (e.g. iPhone). Runs face detection + emotion, draws boxes; updates MJPEG /stream. Returns session_id for polling play commands."""
     global _latest_jpeg, _frame_event, _http_frame_session_id
     body = await request.body()
     if not body or len(body) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Empty or too large")
-    _latest_jpeg = await asyncio.to_thread(_process_frame_faces, body)
+    _latest_jpeg = await asyncio.to_thread(process_frame, body)
     _frame_event.set()
 
     nparr = np.frombuffer(body, np.uint8)
@@ -230,25 +390,11 @@ async def api_frame(request: Request):
     return {"session_id": _http_frame_session_id}
 
 
-def _on_track_http(track):
-    """Same as on_track for WebSocket: relay video, blackhole audio."""
-    logger.info("Received %s track (HTTP broadcaster)", track.kind)
-    if track.kind == "video":
-        asyncio.ensure_future(_consume_video_track(track))
-    else:
-        blackhole = MediaBlackhole()
-        blackhole.addTrack(track)
-        asyncio.ensure_future(blackhole.start())
-
-
 @app.post("/api/signal")
 async def api_signal(body: dict = Body(default={})):
-    """HTTP fallback for signaling when WebSocket is blocked. Body: { \"type\": \"offer\", \"sdp\": \"...\" }. Returns answer and session_id for polling play commands."""
     global _http_broadcaster_pc, _http_broadcaster_session_id
-    sdp = body.get("sdp")
-    if not sdp or body.get("type") != "offer":
+    if body.get("type") != "offer" or not body.get("sdp"):
         raise HTTPException(status_code=400, detail="Need { \"type\": \"offer\", \"sdp\": \"...\" }")
-    # Close previous HTTP broadcaster if any
     if _http_broadcaster_pc:
         try:
             await _http_broadcaster_pc.close()
@@ -257,11 +403,14 @@ async def api_signal(body: dict = Body(default={})):
         _http_broadcaster_pc = None
         _http_broadcaster_session_id = None
     _http_play_commands.clear()
-    offer = RTCSessionDescription(sdp=sdp, type="offer")
+    offer = RTCSessionDescription(sdp=body["sdp"], type="offer")
     pc = RTCPeerConnection()
     _http_broadcaster_pc = pc
     _http_broadcaster_session_id = str(uuid.uuid4())
-    pc.on("track", _on_track_http)
+    def on_track_http(track):
+        logger.info("Received %s track (HTTP)", track.kind)
+        _on_video_track(track)
+    pc.on("track", on_track_http)
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
@@ -275,44 +424,42 @@ async def api_signal(body: dict = Body(default={})):
 
 @app.get("/api/poll")
 async def api_poll(session_id: str = ""):
-    """Poll for play commands (HTTP broadcaster or frame uploader). Returns next command or { \"pending\": true }."""
-    global _http_play_commands
     if session_id not in (_http_broadcaster_session_id, _http_frame_session_id):
         return {"pending": True}
     if not _http_play_commands:
         return {"pending": True}
-    cmd = _http_play_commands.pop(0)
-    return cmd
+    return _http_play_commands.pop(0)
+
+
+# -----------------------------------------------------------------------------
+# Play & static
+# -----------------------------------------------------------------------------
 
 
 @app.post("/api/play")
 async def api_play(body: dict = Body(default={})):
-    """Request that all connected clients play an audio file or URL. Body: { \"file\": \"name.mp3\" } or { \"url\": \"https://...\" }."""
-    file = body.get("file")
-    url = body.get("url")
+    file, url = body.get("file"), body.get("url")
     if not file and not url:
         return {"ok": False, "error": "Provide 'file' or 'url'"}
     base = os.environ.get("SERVER_BASE", "http://localhost:8000")
-    if file:
-        play_url = f"{base}/audio/{file}"
-    else:
-        play_url = url
+    play_url = f"{base}/audio/{file}" if file else url
     payload = {"action": "play", "url": play_url}
-    dead = set()
-    for ws in connected_clients:
+    for ws in list(connected_clients):
         try:
             await ws.send_json(payload)
         except Exception:
-            dead.add(ws)
-    for ws in dead:
-        connected_clients.discard(ws)
+            connected_clients.discard(ws)
     _http_play_commands.append(payload)
     return {"ok": True, "url": play_url}
 
 
+@app.get("/api/ping")
+async def api_ping():
+    return {"ok": True}
+
+
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
-    """Serve an audio file from the audio directory."""
     if ".." in filename or "/" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
     path = (AUDIO_DIR / filename).resolve()
@@ -323,18 +470,15 @@ async def serve_audio(filename: str):
 
 @app.get("/api/audio")
 async def list_audio():
-    """List available audio files."""
     files = [f.name for f in AUDIO_DIR.iterdir() if f.suffix.lower() in (".mp3", ".wav", ".m4a")]
     return {"files": sorted(files)}
 
 
-# Serve static files (web app)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/")
 async def index():
-    """Serve the main web app (iPhone client)."""
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         return {"message": "Put index.html in the static/ directory"}
