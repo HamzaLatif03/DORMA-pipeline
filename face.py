@@ -1,7 +1,6 @@
 """
-Face database. Uses face_recognition (dlib 128D) for detection and recall when available.
-Pattern from https://github.com/ageitgey/face_recognition - compare_faces + face_distance.
-Falls back to DeepFace if face_recognition not installed (dlib needs CMake).
+Face detection and recognition. Uses face_recognition (dlib) when available, else DeepFace.
+Assigns persistent IDs (face_1, face_2, ...) and recalls known faces across frames.
 """
 import json
 import logging
@@ -13,7 +12,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Try face_recognition first (dlib 128D, best recall - requires cmake for dlib)
 try:
     import face_recognition as fr
     USE_FACE_RECOGNITION = True
@@ -23,15 +21,15 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 FACES_JSON = BASE_DIR / "faces.json"
-# face_recognition: tolerance = max distance to count as same person. Lower = stricter, more new IDs
 FACE_MATCH_TOLERANCE = 0.5
+DEEPFACE_MATCH_THRESHOLD = 1.0
 MAX_EMBEDDINGS_PER_PERSON = 20
 
 _last_detected_face_ids: list[str] = []
 
 
 class FaceRegistry:
-    """Stores face encodings. Uses compare_faces + face_distance for recall (face_recognition pattern)."""
+    """Stores face encodings. Uses compare_faces + face_distance for recall."""
 
     def __init__(self, path: Path = FACES_JSON):
         self.path = path
@@ -40,7 +38,6 @@ class FaceRegistry:
         self._load()
 
     def _to_encoding(self, emb) -> list[float] | None:
-        """Flatten to 128D list for dlib-style encodings."""
         if emb is None:
             return None
         try:
@@ -87,20 +84,16 @@ class FaceRegistry:
             logger.warning("Could not save face registry: %s", e)
 
     def _get_known_encodings_and_ids(self) -> tuple[list, list[str]]:
-        """Return (encodings, ids) for face_recognition compare_faces."""
-        encodings = []
-        ids = []
+        encodings, ids = [], []
         for pid, ent in self.entries.items():
             embs = ent.get("embeddings") or []
             for emb in embs:
-                e = self._to_encoding(emb)
-                if e is not None:
+                if (e := self._to_encoding(emb)) is not None:
                     encodings.append(e)
                     ids.append(pid)
         return encodings, ids
 
     def find_or_create(self, encoding: list[float]) -> str:
-        """Use face_recognition-style compare_faces + face_distance. Match → existing ID; else new ID."""
         enc = self._to_encoding(encoding)
         if enc is None:
             return self.create_new_id()
@@ -126,15 +119,11 @@ class FaceRegistry:
                 return person_id
         else:
             enc_arr = np.array(enc, dtype=float)
-            best_id = None
-            best_dist = float("inf")
+            best_id, best_dist = None, float("inf")
             for i, k in enumerate(known_encodings):
                 d = float(np.linalg.norm(np.array(k, dtype=float) - enc_arr))
                 if d < best_dist:
-                    best_dist = d
-                    best_id = known_ids[i]
-            # DeepFace L2: only match when very close; else create new ID (different person)
-            DEEPFACE_MATCH_THRESHOLD = 1.0
+                    best_dist, best_id = d, known_ids[i]
             if best_id is not None and best_dist <= DEEPFACE_MATCH_THRESHOLD:
                 embs = self.entries[best_id].setdefault("embeddings", [])
                 embs.append(enc)
@@ -168,7 +157,10 @@ class FaceRegistry:
         return True
 
     def list_all(self) -> list[dict]:
-        return [{"person_id": pid, **{k: v for k, v in ent.items() if k not in ("embedding", "embeddings")}} for pid, ent in self.entries.items()]
+        return [
+            {"person_id": pid, **{k: v for k, v in ent.items() if k not in ("embedding", "embeddings")}}
+            for pid, ent in self.entries.items()
+        ]
 
 
 _registry: FaceRegistry | None = None
@@ -186,26 +178,19 @@ def get_last_detected_ids() -> list[str]:
 
 
 def _draw_face_box_and_name(img, left: int, top: int, right: int, bottom: int, name: str):
-    """Draw red box and label like face_recognition example (Barack, Adam, Rebecca style)."""
     cv2.rectangle(img, (left, top), (right, bottom), (0, 0, 255), 2)
     cv2.rectangle(img, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
-    font = cv2.FONT_HERSHEY_DUPLEX
-    cv2.putText(img, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
+    cv2.putText(img, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 1.0, (255, 255, 255), 1)
 
 
 def _process_with_face_recognition(img: np.ndarray) -> list[tuple[int, int, int, int, list[float]]]:
-    """face_recognition path: face_locations + face_encodings (dlib 128D)."""
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     face_locations = fr.face_locations(rgb, model="hog")
     face_encodings = fr.face_encodings(rgb, face_locations, num_jitters=1)
-    out = []
-    for (top, right, bottom, left), enc in zip(face_locations, face_encodings):
-        out.append((left, top, right, bottom, enc.tolist()))
-    return out
+    return [(left, top, right, bottom, enc.tolist()) for (top, right, bottom, left), enc in zip(face_locations, face_encodings)]
 
 
 def _process_with_deepface(img: np.ndarray) -> list[tuple[int, int, int, int, list[float] | None]]:
-    """DeepFace fallback path."""
     out = []
     try:
         reps = DeepFace.represent(
@@ -229,8 +214,7 @@ def _process_with_deepface(img: np.ndarray) -> list[tuple[int, int, int, int, li
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         face_cascade = cv2.CascadeClassifier(cascade_path)
-        rects = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        for (x, y, w, h) in rects:
+        for (x, y, w, h) in face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)):
             crop = img[max(0, y) : y + h, max(0, x) : x + w]
             if crop.size == 0:
                 continue
@@ -247,38 +231,24 @@ def _process_with_deepface(img: np.ndarray) -> list[tuple[int, int, int, int, li
     return out
 
 
-def process_frame_faces(jpeg_bytes: bytes) -> bytes:
-    """
-    Real-time face detection + recall (face_recognition pattern).
-    Uses face_recognition (dlib) when available, else DeepFace.
-    """
+def process_frame(jpeg_bytes: bytes) -> bytes:
+    """Run face detection + recognition on a JPEG frame. Draw boxes and IDs; return annotated JPEG."""
     global _last_detected_face_ids
     try:
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
             return jpeg_bytes
-
         registry = get_registry()
         _last_detected_face_ids = []
-
-        if USE_FACE_RECOGNITION:
-            faces = _process_with_face_recognition(img)
-        else:
-            faces = _process_with_deepface(img)
-
+        faces = _process_with_face_recognition(img) if USE_FACE_RECOGNITION else _process_with_deepface(img)
         for item in faces:
-            if len(item) == 5:
-                left, top, right, bottom, enc = item
-            else:
+            if len(item) != 5:
                 continue
-            if enc is not None:
-                person_id = registry.find_or_create(enc)
-            else:
-                person_id = registry.create_new_id()
+            left, top, right, bottom, enc = item
+            person_id = registry.find_or_create(enc) if enc is not None else registry.create_new_id()
             _last_detected_face_ids.append(person_id)
             _draw_face_box_and_name(img, left, top, right, bottom, person_id)
-
         _, out_buf = cv2.imencode(".jpg", img)
         return out_buf.tobytes()
     except Exception as e:
