@@ -4,6 +4,10 @@ import os
 import warnings
 from pathlib import Path
 
+from dotenv import load_dotenv
+# Load .env from project root (parent of server/)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 warnings.filterwarnings("ignore")
@@ -26,6 +30,8 @@ BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "audio"
 STATIC_DIR = BASE_DIR / "static"
 AUDIO_DIR.mkdir(exist_ok=True)
+# So TTS (voice_11labs) writes to the same dir the server serves from
+os.environ["AUDIO_OUTPUT_DIR"] = str(AUDIO_DIR.resolve())
 STATIC_DIR.mkdir(exist_ok=True)
 
 app.include_router(signaling.router)

@@ -76,17 +76,20 @@ async def _pcm_loop():
 async def _encoded_loop():
     global _transcript_encoded_chunks
     while True:
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(2)
         chunks = list(_transcript_encoded_chunks)
-        if not chunks or sum(len(c) for c in chunks) < 8000:
+        if not chunks:
             continue
-        combined = b"".join(chunks)
-        if len(chunks) > 1:
-            _transcript_encoded_chunks[:] = [chunks[0]]
-        else:
-            _transcript_encoded_chunks.clear()
-        content_type = "audio/mp4" if b"ftyp" in combined[:32] else "audio/webm"
-        text = await _transcribe(combined, content_type)
+        _transcript_encoded_chunks.clear()
+        # Prefer a chunk that looks like media (WebM Cluster) or take largest; need enough bytes for STT
+        def _is_webm_cluster(b: bytes) -> bool:
+            return len(b) >= 4 and b[0:4] == bytes([0x1F, 0x43, 0xB6, 0x75])
+        media_like = [c for c in chunks if _is_webm_cluster(c) and len(c) >= 300]
+        audio_data = max(media_like, key=len) if media_like else max(chunks, key=len)
+        if len(audio_data) < 300:
+            continue
+        content_type = "audio/mp4" if len(audio_data) >= 8 and audio_data[4:8] == b"ftyp" else "audio/webm"
+        text = await _transcribe(audio_data, content_type)
         if not text:
             continue
         for q in _transcript_sse_queues:
@@ -94,6 +97,17 @@ async def _encoded_loop():
                 q.put_nowait({"text": text, "interim": False})
             except asyncio.QueueFull:
                 pass
+        # Trigger reply + TTS
+        try:
+            from mongodb.reply_api import get_conversational_reply
+            from mongodb.voice_11labs import speak_text
+            reply_text = get_conversational_reply(text)
+            print("[TTS] Reply for TTS (run.py transcript):", repr((reply_text or "")[:200]))
+            if reply_text:
+                server_base = os.environ.get("SERVER_BASE", "http://localhost:8000")
+                speak_text(reply_text, play_after=True, server_base=server_base)
+        except Exception as e:
+            logger.warning("Reply+TTS failed: %s", e)
 
 
 def add_pcm(data: bytes, sample_rate: int, channels: int) -> None:

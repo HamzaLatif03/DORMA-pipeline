@@ -12,6 +12,9 @@ import time
 import uuid
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +28,22 @@ from transcript import add_encoded, add_pcm, get_sse_queue_count, get_sse_queues
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _reply_with_tts(transcript_text: str) -> None:
+    """Run in thread: get a unique reply from the API, then TTS and play (real conversation)."""
+    try:
+        from mongodb.reply_api import get_conversational_reply
+        from mongodb.voice_11labs import speak_text
+        # Unique response from API (e.g. OpenAI), not an echo
+        text_to_speak = get_conversational_reply(transcript_text)
+        if not text_to_speak:
+            text_to_speak = "I didn't catch that."
+        print("[TTS] Speaking (run.py):", repr(text_to_speak[:200]))
+        server_base = os.environ.get("SERVER_BASE", "http://localhost:8000")
+        speak_text(text_to_speak, play_after=True, server_base=server_base)
+    except Exception as e:
+        logger.exception("TTS reply failed: %s", e)
 
 app = FastAPI(title="iPhone peripherals bridge")
 
@@ -203,7 +222,12 @@ async def websocket_audio(websocket: WebSocket):
     _audio_connections.add(websocket)
     try:
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except RuntimeError:
+                break
+            if msg.get("type") == "websocket.disconnect":
+                break
             data = msg.get("bytes")
             if data and isinstance(data, bytes):
                 if len(data) >= 8 and os.environ.get("ELEVENLABS_API_KEY"):
@@ -226,15 +250,26 @@ async def websocket_audio(websocket: WebSocket):
         _audio_connections.discard(websocket)
 
 
+def _is_acceptable_encoded_audio(body: bytes) -> bool:
+    """Accept MP4 init, WebM init, WebM Cluster (media), or any sizable chunk so we don't drop speech."""
+    if not body or len(body) > 2 * 1024 * 1024:
+        return False
+    if len(body) >= 8 and body[4:8] == b"ftyp":
+        return True  # MP4
+    if len(body) >= 4 and body[0:4] == bytes([0x1A, 0x45, 0xDF, 0xA3]):
+        return True  # WebM EBML header
+    if len(body) >= 4 and body[0:4] == bytes([0x1F, 0x43, 0xB6, 0x75]):
+        return True  # WebM Cluster (actual media from MediaRecorder)
+    if len(body) >= 256:
+        return True  # Likely continuation/media; accept so STT can try
+    return False
+
+
 @app.post("/api/audio/encoded")
 async def api_audio_encoded(request: Request):
     global _diag_audio_encoded_count, _diag_audio_encoded_last
     body = await request.body()
-    if not body or len(body) < 4 or len(body) > 2 * 1024 * 1024:
-        return {"ok": False}
-    is_mp4 = len(body) >= 8 and body[4:8] == b"ftyp"
-    is_webm = len(body) >= 4 and body[0:4] == bytes([0x1A, 0x45, 0xDF, 0xA3])
-    if not (is_mp4 or is_webm):
+    if not _is_acceptable_encoded_audio(body):
         return {"ok": False}
     _diag_audio_encoded_count += 1
     _diag_audio_encoded_last = time.time()
@@ -289,9 +324,13 @@ async def api_audio_stream():
 @app.post("/api/transcript")
 async def api_transcript(body: dict = Body(default={})):
     text = (body.get("text") or body.get("transcript") or "").strip()
+    interim = body.get("interim", False)
     if not text:
         return {"ok": False}
-    push_text(text, body.get("interim", False))
+    push_text(text, interim)
+    # When user finishes a phrase (final transcript), respond with TTS so something comes back (conversational loop)
+    if not interim and text:
+        asyncio.get_event_loop().run_in_executor(None, _reply_with_tts, text)
     return {"ok": True}
 
 
@@ -460,8 +499,13 @@ async def serve_audio(filename: str):
 
 @app.get("/api/audio")
 async def list_audio():
-    files = [f.name for f in AUDIO_DIR.iterdir() if f.suffix.lower() in (".mp3", ".wav", ".m4a")]
-    return {"files": sorted(files)}
+    """List audio files and show where they are stored on disk (for debugging playback)."""
+    path_str = str(AUDIO_DIR.resolve())
+    try:
+        files = [f.name for f in AUDIO_DIR.iterdir() if f.suffix.lower() in (".mp3", ".wav", ".m4a")]
+    except OSError:
+        files = []
+    return {"audio_dir": path_str, "files": sorted(files)}
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

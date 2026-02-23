@@ -48,6 +48,7 @@
 <body>
   <h1>iPhone Peripherals</h1>
   <p>Stream camera + mic to the server and play audio from the server.</p>
+  <p style="font-size:0.85rem; color:#6c6;">When connected, server audio (e.g. Eleven Labs TTS) plays on <strong>this device</strong>. Open this page via ngrok HTTPS on the phone so playback works.</p>
   <p style="font-size:0.85rem; color:#888;">iPhone: camera only works over <strong>HTTPS</strong>. Use ngrok: on the Mac run <code>ngrok http 8000</code>, then on the iPhone open the <strong>https://</strong> URL (not http).</p>
 
   <div class="section" id="troubleshootSection" style="background:#252525; padding:0.75rem; border-radius:8px; margin-bottom:1rem;">
@@ -98,6 +99,7 @@
       let localStream = null;
       let pollIntervalId = null;
       let frameIntervalId = null;
+      let mediaRecorder = null;
       let facingMode = 'user';
       const audioEl = new Audio();
 
@@ -160,6 +162,12 @@
           const stream = await startCapture();
           setStatus('Camera on. Sending video to Mac…');
           preview.srcObject = stream;
+          // Unlock audio on iOS: one silent play while we're still in the user gesture (Connect tap)
+          // so that later server-triggered Eleven Labs playback works
+          try {
+            audioEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+            audioEl.play().catch(function() {});
+          } catch (e) {}
           var sessionId = null;
           var canvas = document.createElement('canvas');
           var ctx = canvas.getContext('2d');
@@ -183,9 +191,12 @@
                         .then(function(pr) { return pr.json(); })
                         .then(function(cmd) {
                           if (cmd.action === 'play' && cmd.url) {
-                            audioEl.src = cmd.url;
+                            var playUrl = cmd.url;
+                            var m = playUrl.match(/\/audio\/([^/?#]+)/);
+                            if (m) playUrl = base + '/audio/' + m[1];
+                            audioEl.src = playUrl;
                             audioEl.play().catch(function() {});
-                            setStatus('Playing: ' + cmd.url);
+                            setStatus('Playing: ' + playUrl);
                           }
                         })
                         .catch(function() {});
@@ -198,6 +209,24 @@
           }
           frameIntervalId = setInterval(sendFrame, 200);
           sendFrame();
+
+          // Mic: send audio to server so it can transcribe and reply (STT → Gemini → TTS)
+          var audioTracks = stream.getAudioTracks();
+          if (audioTracks.length && window.MediaRecorder) {
+            var mime = '';
+            if (MediaRecorder.isTypeSupported('audio/mp4')) mime = 'audio/mp4';
+            else if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) mime = 'audio/webm;codecs=opus';
+            else if (MediaRecorder.isTypeSupported('audio/webm')) mime = 'audio/webm';
+            try {
+              mediaRecorder = new MediaRecorder(new MediaStream(audioTracks), mime ? { mimeType: mime } : {});
+              mediaRecorder.ondataavailable = function(ev) {
+                if (ev.data && ev.data.size) {
+                  fetch(base + '/api/audio/encoded', { method: 'POST', body: ev.data }).catch(function() {});
+                }
+              };
+              mediaRecorder.start(1000);
+            } catch (e) {}
+          }
         } catch (err) {
           var msg = err.message || String(err);
           if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
@@ -218,6 +247,10 @@
         if (pollIntervalId) {
           clearInterval(pollIntervalId);
           pollIntervalId = null;
+        }
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          try { mediaRecorder.stop(); } catch (e) {}
+          mediaRecorder = null;
         }
         if (ws) {
           ws.close();

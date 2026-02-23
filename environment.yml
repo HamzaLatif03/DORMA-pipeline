@@ -22,3 +22,6 @@ dependencies:
     - face_recognition>=1.3
     - deepface>=0.0.79
     - tf-keras>=2.16
+    - simple-ai-agents>=0.5
+    - openai>=1.0
+    - google-generativeai>=0.8

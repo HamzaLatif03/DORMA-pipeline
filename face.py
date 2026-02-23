@@ -177,14 +177,41 @@ def get_last_detected_ids() -> list[str]:
     return _last_detected_face_ids
 
 
-def _draw_face_box_and_name(img, left: int, top: int, right: int, bottom: int, name: str):
+def _draw_face_box_and_name(img, left: int, top: int, right: int, bottom: int, name: str, emotion: str = ""):
+    label = emotion if emotion else "?"
     cv2.rectangle(img, (left, top), (right, bottom), (0, 0, 255), 2)
-    cv2.rectangle(img, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
-    cv2.putText(img, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 1.0, (255, 255, 255), 1)
+    cv2.rectangle(img, (left, bottom - 28), (right, bottom), (0, 0, 255), cv2.FILLED)
+    cv2.putText(img, label, (left + 4, bottom - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+_OPENCV_CASCADE = None
+
+
+def _get_opencv_cascade():
+    global _OPENCV_CASCADE
+    if _OPENCV_CASCADE is None:
+        _OPENCV_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    return _OPENCV_CASCADE
+
+
+def _emotion_for_crop(img: np.ndarray, x: int, y: int, w: int, h: int) -> str:
+    """Get dominant emotion for a face crop using DeepFace; return '' on failure."""
+    try:
+        from deepface import DeepFace as _DF
+        crop = img[max(0, y) : y + h, max(0, x) : x + w]
+        if crop.size == 0:
+            return ""
+        analyses = _DF.analyze(crop, actions=["emotion"], enforce_detection=False, detector_backend="skip", silent=True)
+        entry = analyses[0] if isinstance(analyses, list) and analyses else analyses
+        return (entry.get("dominant_emotion") or "").strip()
+    except Exception:
+        return ""
 
 
 def _process_with_face_recognition(img: np.ndarray) -> list[tuple[int, int, int, int, list[float]]]:
+    # dlib/face_recognition require 8-bit RGB; ensure contiguous
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    rgb = np.ascontiguousarray(rgb)
     face_locations = fr.face_locations(rgb, model="hog")
     face_encodings = fr.face_encodings(rgb, face_locations, num_jitters=1)
     return [(left, top, right, bottom, enc.tolist()) for (top, right, bottom, left), enc in zip(face_locations, face_encodings)]
@@ -231,24 +258,50 @@ def _process_with_deepface(img: np.ndarray) -> list[tuple[int, int, int, int, li
     return out
 
 
+def _ensure_rgb_uint8(img: np.ndarray) -> np.ndarray | None:
+    """Ensure image is 3-channel uint8 BGR for OpenCV; face_recognition gets RGB from caller."""
+    if img is None or img.size == 0:
+        return None
+    if img.dtype != np.uint8:
+        try:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        except Exception:
+            return None
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    if img.ndim != 3 or img.shape[2] != 3:
+        return None
+    return np.ascontiguousarray(img)
+
+
 def process_frame(jpeg_bytes: bytes) -> bytes:
-    """Run face detection + recognition on a JPEG frame. Draw boxes and IDs; return annotated JPEG."""
+    """Detect faces with OpenCV Haar cascade; draw boxes, face ID and emotion. OpenCV-only detection for reliability."""
     global _last_detected_face_ids
     try:
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
             return jpeg_bytes
-        registry = get_registry()
+        h_img, w_img = img.shape[:2]
+        if h_img < 30 or w_img < 30:
+            return jpeg_bytes
+        img = np.ascontiguousarray(img)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cascade = _get_opencv_cascade()
+        rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        if rects is None or len(rects) == 0:
+            _last_detected_face_ids = []
+            _, out_buf = cv2.imencode(".jpg", img)
+            return out_buf.tobytes()
         _last_detected_face_ids = []
-        faces = _process_with_face_recognition(img) if USE_FACE_RECOGNITION else _process_with_deepface(img)
-        for item in faces:
-            if len(item) != 5:
-                continue
-            left, top, right, bottom, enc = item
-            person_id = registry.find_or_create(enc) if enc is not None else registry.create_new_id()
-            _last_detected_face_ids.append(person_id)
-            _draw_face_box_and_name(img, left, top, right, bottom, person_id)
+        for i, (x, y, w, h) in enumerate(rects):
+            x, y, w, h = int(x), int(y), int(w), int(h)
+            left, top, right, bottom = x, y, x + w, y + h
+            _last_detected_face_ids.append(f"face_{i + 1}")
+            emotion = _emotion_for_crop(img, x, y, w, h)
+            _draw_face_box_and_name(img, left, top, right, bottom, "", emotion)
         _, out_buf = cv2.imencode(".jpg", img)
         return out_buf.tobytes()
     except Exception as e:
